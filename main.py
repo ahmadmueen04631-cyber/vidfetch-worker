@@ -1,13 +1,9 @@
 import os
 import re
-import tempfile
-import shutil
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query, Response, BackgroundTasks
-from fastapi.responses import StreamingResponse, FileResponse
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
-import requests
 
 try:
     import imageio_ffmpeg
@@ -17,8 +13,8 @@ except Exception:
 
 app = FastAPI(
     title="VidFetch Free Extractor Worker",
-    description="High-performance media extraction microservice powered by yt-dlp",
-    version="1.2.0"
+    description="High-performance media extraction powered by yt-dlp",
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -29,46 +25,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Cookie helpers ─────────────────────────────────────────────
+
+def _write_cookies_to_tmp() -> Optional[str]:
+    """If COOKIES_TEXT env var is set, write it to a temp file and return its path."""
+    cookie_text = os.getenv("COOKIES_TEXT")
+    if cookie_text:
+        tmp = "/tmp/yt_cookies.txt"
+        with open(tmp, "w") as f:
+            f.write(cookie_text)
+        return tmp
+    return None
+
+def _cookie_file_path() -> Optional[str]:
+    """Return the best available cookie file path, or None."""
+    env_file = os.getenv("COOKIES_FILE")
+    if env_file and os.path.exists(env_file):
+        return env_file
+    tmp = _write_cookies_to_tmp()
+    if tmp:
+        return tmp
+    if os.path.exists("cookies.txt"):
+        return "cookies.txt"
+    return None
+
+# ─── yt-dlp options factory ─────────────────────────────────────
+
 def get_ydl_base_opts() -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "no_color": True,
         "ffmpeg_location": FFMPEG_BIN,
+        # android_vr is the most reliable non-SABR client — works from server IPs when cookies provided
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr", "android"]
+                "player_client": ["android_vr"]
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     }
-    cookie_file = os.getenv("COOKIES_FILE", "cookies.txt")
-    if os.path.exists(cookie_file):
+    cookie_file = _cookie_file_path()
+    if cookie_file:
         opts["cookiefile"] = cookie_file
-    elif os.getenv("COOKIES_TEXT"):
-        tmp_cookie = "cookies.tmp.txt"
-        with open(tmp_cookie, "w") as f:
-            f.write(os.getenv("COOKIES_TEXT", ""))
-        opts["cookiefile"] = tmp_cookie
     return opts
+
+# ─── Endpoints ───────────────────────────────────────────────────
 
 @app.get("/")
 def health_check():
+    cookie_file = _cookie_file_path()
     return {
         "status": "healthy",
         "service": "vidfetch-worker",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "yt_dlp_version": yt_dlp.version.__version__,
-        "ffmpeg_available": bool(FFMPEG_BIN and os.path.exists(FFMPEG_BIN))
+        "ffmpeg_available": bool(FFMPEG_BIN and os.path.exists(FFMPEG_BIN)),
+        "cookies_configured": cookie_file is not None,
     }
 
 @app.get("/info")
 def get_video_info(url: str = Query(..., description="Target video URL")):
     """
-    Extracts complete metadata and genuine format download options
+    Extract video metadata + download options.
+    The download options contain direct googlevideo.com CDN stream URLs.
     """
     try:
         opts = get_ydl_base_opts()
@@ -82,78 +106,68 @@ def get_video_info(url: str = Query(..., description="Target video URL")):
             raw_formats = info.get("formats", [])
             download_options: List[Dict[str, Any]] = []
 
-            # 1. Genuine Audio-only Track (MP3)
-            # Find best audio track
+            # ── Audio-only track ──────────────────────────────
             audio_formats = [
                 f for f in raw_formats
-                if (f.get("vcodec") == "none" or not f.get("vcodec")) and f.get("acodec") != "none"
+                if f.get("url") and
+                   (f.get("vcodec") in (None, "none") or not f.get("vcodec")) and
+                   f.get("acodec") not in (None, "none")
             ]
             best_audio = audio_formats[-1] if audio_formats else None
-            audio_size = best_audio.get("filesize") or best_audio.get("filesize_approx") if best_audio else None
-
             download_options.append({
                 "id": "worker-audio-mp3",
-                "label": "Audio Track (MP3 320kbps)",
+                "label": "Audio Track (MP3)",
                 "format": "mp3",
                 "quality": "audio",
                 "isAudioOnly": True,
-                "fileSize": audio_size,
-                "downloadUrl": best_audio.get("url") if best_audio and best_audio.get("url") else url,
+                "fileSize": (best_audio.get("filesize") or best_audio.get("filesize_approx")) if best_audio else None,
+                "downloadUrl": best_audio.get("url") if best_audio else url,
             })
 
-            # 2. Extract distinct video resolutions
-            # Check what video heights actually exist
-            available_heights = set()
-            for f in raw_formats:
-                h = f.get("height")
-                if h and f.get("vcodec") != "none":
-                    available_heights.add(h)
+            # ── Video resolution tiers ────────────────────────
+            video_formats = [
+                f for f in raw_formats
+                if f.get("url") and f.get("height") and
+                   f.get("vcodec") not in (None, "none")
+            ]
+            available_heights = {f["height"] for f in video_formats}
+            max_h = max(available_heights) if available_heights else 360
 
-            # Standard resolution tiers
             tiers = [
                 {"height": 1080, "label": "Full HD (1080p MP4)", "quality": "1080p"},
-                {"height": 720, "label": "HD (720p MP4)", "quality": "720p"},
-                {"height": 480, "label": "SD (480p MP4)", "quality": "480p"},
-                {"height": 360, "label": "Compact (360p MP4)", "quality": "360p"},
+                {"height": 720,  "label": "HD (720p MP4)",       "quality": "720p"},
+                {"height": 480,  "label": "SD (480p MP4)",        "quality": "480p"},
+                {"height": 360,  "label": "Compact (360p MP4)",   "quality": "360p"},
             ]
 
-            max_source_h = max(available_heights) if available_heights else 360
-
+            added = False
             for tier in tiers:
                 target_h = tier["height"]
-                # Only offer this tier if the source video has this resolution or if it's the fallback
-                if target_h > max_source_h and target_h != 360:
-                    continue
+                if target_h > max_h:
+                    continue  # source video can't support this tier
 
-                # Find direct stream format matching this resolution
-                # Prioritize progressive (has audio + video)
-                prog_matching = [
-                    f for f in raw_formats
-                    if f.get("height") == target_h and f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")
+                # Prefer progressive (has audio+video), otherwise video-only at this height
+                matching = [
+                    f for f in video_formats if f["height"] == target_h
                 ]
+                prog = [f for f in matching if f.get("acodec") not in (None, "none")]
+                best = (prog[-1] if prog else matching[-1]) if matching else None
 
-                # Or video-only format at this height
-                vid_matching = [
-                    f for f in raw_formats
-                    if f.get("height") == target_h and f.get("vcodec") != "none" and f.get("url")
-                ]
+                stream_url = best["url"] if best else url
+                size = (best.get("filesize") or best.get("filesize_approx")) if best else None
 
-                best_match = prog_matching[-1] if prog_matching else (vid_matching[-1] if vid_matching else None)
-                stream_url = best_match.get("url") if best_match else None
-                size = best_match.get("filesize") or best_match.get("filesize_approx") if best_match else None
-
-                # If no direct format URL at this height, fall back to watch URL (which download route resolves)
                 download_options.append({
                     "id": f"worker-{tier['quality']}",
                     "label": tier["label"],
                     "format": "mp4",
                     "quality": tier["quality"],
                     "fileSize": size,
-                    "downloadUrl": stream_url or url,
+                    "downloadUrl": stream_url,
                 })
+                added = True
 
-            # If no video tiers matched, add fallback 360p
-            if len([d for d in download_options if not d.get("isAudioOnly")]) == 0:
+            if not added:
+                # Absolute fallback — use the watch URL and let /extract handle it
                 download_options.append({
                     "id": "worker-360p",
                     "label": "Standard Video (MP4)",
@@ -174,7 +188,7 @@ def get_video_info(url: str = Query(..., description="Target video URL")):
                     "likeCount": info.get("like_count"),
                     "originalUrl": url,
                 },
-                "downloads": download_options
+                "downloads": download_options,
             }
 
     except HTTPException:
@@ -182,50 +196,59 @@ def get_video_info(url: str = Query(..., description="Target video URL")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/extract")
 def extract_video(
     url: str = Query(..., description="Target video URL"),
-    format: str = Query("mp4", description="Desired format (mp4 or mp3)"),
-    height: int = Query(1080, description="Target height")
+    format: str = Query("mp4", description="Desired format: mp4 or mp3"),
+    height: int = Query(1080, description="Target resolution height (e.g. 1080)")
 ):
     """
-    Resolves direct binary CDN stream URL for a given format
+    Resolves the best direct binary CDN stream URL for the given format/height.
+    Used by the download proxy when the downloadUrl from /info needs re-resolving.
     """
     try:
         opts = get_ydl_base_opts()
         opts["skip_download"] = True
 
         if format == "mp3":
-            opts["format"] = "bestaudio/best"
+            opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         else:
-            # Look for progressive first, then best video up to height
-            opts["format"] = f"best[height<={height}][ext=mp4]/bestvideo[height<={height}]+bestaudio/best"
+            opts["format"] = (
+                f"bestvideo[height={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"best[height<={height}][ext=mp4]/"
+                f"best[height<={height}]/best"
+            )
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                raise HTTPException(status_code=404, detail="No video stream found")
+                raise HTTPException(status_code=404, detail="No stream found")
 
-            direct_url = info.get("url")
+            raw = info.get("formats", [])
 
-            # If extracting audio specifically
             if format == "mp3":
-                raw_formats = info.get("formats", [])
-                audio_formats = [
-                    f for f in raw_formats
-                    if (f.get("vcodec") == "none" or not f.get("vcodec")) and f.get("acodec") != "none" and f.get("url")
+                audio_only = [
+                    f for f in raw
+                    if f.get("url") and
+                       f.get("vcodec") in (None, "none") and
+                       f.get("acodec") not in (None, "none")
                 ]
-                if audio_formats:
-                    direct_url = audio_formats[-1].get("url")
-
-            if not direct_url and "formats" in info:
-                formats = info["formats"]
-                matching = [f for f in formats if f.get("url")]
-                if matching:
-                    direct_url = matching[-1].get("url")
+                direct_url = audio_only[-1]["url"] if audio_only else info.get("url")
+            else:
+                direct_url = info.get("url")
+                if not direct_url:
+                    vid_only = [
+                        f for f in raw
+                        if f.get("url") and f.get("height") and
+                           (f.get("height") <= height)
+                    ]
+                    if vid_only:
+                        direct_url = vid_only[-1]["url"]
 
             if not direct_url:
-                raise HTTPException(status_code=502, detail="Unable to resolve stream URL")
+                raise HTTPException(status_code=502, detail="Unable to resolve binary stream URL")
 
             return {
                 "url": direct_url,
