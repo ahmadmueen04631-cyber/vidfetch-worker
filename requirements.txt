@@ -3,4 +3,3 @@ uvicorn>=0.28.0
 yt-dlp>=2025.10.01
 requests>=2.31.0
 imageio-ffmpeg>=0.5.1
-yt-dlp-get-pot>=0.3.0

@@ -52,26 +52,32 @@ def _cookie_file_path() -> Optional[str]:
 # ─── yt-dlp options factory ─────────────────────────────────────
 
 def get_ydl_base_opts() -> Dict[str, Any]:
+    cookie_file = _cookie_file_path()
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "no_color": True,
         "ffmpeg_location": FFMPEG_BIN,
-        # android_vr is the most reliable non-SABR client — works from server IPs when cookies provided
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android_vr"]
-            }
-        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     }
-    cookie_file = _cookie_file_path()
     if cookie_file:
         opts["cookiefile"] = cookie_file
+        # Browser cookies are only sent to web/mweb clients
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web", "mweb", "android_vr"]
+            }
+        }
+    else:
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android_vr", "android", "web", "mweb"]
+            }
+        }
     return opts
 
 # ─── Endpoints ───────────────────────────────────────────────────
