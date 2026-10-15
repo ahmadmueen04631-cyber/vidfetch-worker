@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote_plus
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -10,6 +11,10 @@ import requests
 
 try:
     from pytubefix import YouTube as PytubeFix
+    import pytubefix.botGuard.bot_guard as bg
+    node_bin = shutil.which("node") or "/usr/bin/node"
+    if node_bin and os.path.exists(node_bin):
+        bg.NODE_PATH = node_bin
     PYTUBE_AVAILABLE = True
 except Exception:
     PYTUBE_AVAILABLE = False
@@ -23,7 +28,7 @@ except Exception:
 app = FastAPI(
     title="VidFetch Free Extractor Worker",
     description="High-performance media extraction powered by yt-dlp & pytubefix",
-    version="1.5.0"
+    version="1.5.1"
 )
 
 app.add_middleware(
@@ -103,21 +108,16 @@ def get_ydl_base_opts() -> Dict[str, Any]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-    }
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["web", "mweb"]
-            }
-        }
-    else:
-        opts["extractor_args"] = {
+        },
+        # Always prioritize android_vr and android to bypass datacenter bot walls
+        "extractor_args": {
             "youtube": {
                 "player_client": ["android_vr", "android", "web", "mweb"]
             }
         }
+    }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
     return opts
 
 def is_youtube_url(url: str) -> bool:
@@ -129,7 +129,6 @@ def get_base_service_url(request: Request) -> str:
     if env_override:
         return env_override.rstrip("/")
     base = str(request.base_url).rstrip("/")
-    # Force https if running on render or reverse proxy
     if "onrender.com" in base and base.startswith("http://"):
         base = "https://" + base[7:]
     return base
@@ -140,14 +139,20 @@ def extract_youtube_pytube(url: str, base_url: str) -> Dict[str, Any]:
     if not PYTUBE_AVAILABLE:
         raise RuntimeError("pytubefix is not installed or available")
 
-    # Try clients in order of reliability
+    # Ensure system node is pointed to for PO token generation
+    try:
+        node_bin = shutil.which("node") or "/usr/bin/node"
+        if node_bin and os.path.exists(node_bin):
+            bg.NODE_PATH = node_bin
+    except Exception:
+        pass
+
     clients = ["WEB", "ANDROID", "MWEB"]
     yt = None
     last_err = None
     for client in clients:
         try:
             candidate = PytubeFix(url, client=client)
-            # Accessing title forces initial metadata fetch
             _ = candidate.title
             yt = candidate
             break
@@ -189,7 +194,7 @@ def extract_youtube_pytube(url: str, base_url: str) -> Dict[str, Any]:
             "downloadUrl": f"{base_url}/stream?url={quote_plus(url)}&itag={s.itag}&format=mp4",
         })
 
-    # 3. Resolution tiers if not already covered (e.g. 1080p, 720p, 480p)
+    # 3. Resolution tiers if not already covered
     target_tiers = [
         {"height": 1080, "res": "1080p", "label": "Full HD (1080p MP4)"},
         {"height": 720,  "res": "720p",  "label": "HD (720p MP4)"},
@@ -211,7 +216,6 @@ def extract_youtube_pytube(url: str, base_url: str) -> Dict[str, Any]:
                 })
                 added_heights.add(tier["height"])
 
-    # Fallback default if nothing added
     if not downloads:
         downloads.append({
             "id": "pytube-default",
@@ -222,7 +226,6 @@ def extract_youtube_pytube(url: str, base_url: str) -> Dict[str, Any]:
             "downloadUrl": f"{base_url}/stream?url={quote_plus(url)}&format=mp4",
         })
 
-    # Sort: highest resolution first, audio at bottom
     def sort_key(d):
         if d.get("isAudioOnly"):
             return -1
@@ -275,7 +278,7 @@ def extract_ytdlp(url: str, base_url: str) -> Dict[str, Any]:
             "quality": "audio",
             "isAudioOnly": True,
             "fileSize": (best_audio.get("filesize") or best_audio.get("filesize_approx")) if best_audio else None,
-            "downloadUrl": best_audio.get("url") if best_audio else f"{base_url}/stream?url={quote_plus(url)}&format=mp3",
+            "downloadUrl": f"{base_url}/stream?url={quote_plus(url)}&format=mp3",
         })
 
         # Video formats
@@ -304,7 +307,6 @@ def extract_ytdlp(url: str, base_url: str) -> Dict[str, Any]:
             prog = [f for f in matching if f.get("acodec") not in (None, "none")]
             best = (prog[-1] if prog else matching[-1]) if matching else None
 
-            stream_url = best["url"] if best else f"{base_url}/stream?url={quote_plus(url)}&format=mp4&height={target_h}"
             size = (best.get("filesize") or best.get("filesize_approx")) if best else None
 
             download_options.append({
@@ -314,7 +316,7 @@ def extract_ytdlp(url: str, base_url: str) -> Dict[str, Any]:
                 "quality": tier["quality"],
                 "isAudioOnly": False,
                 "fileSize": size,
-                "downloadUrl": stream_url,
+                "downloadUrl": f"{base_url}/stream?url={quote_plus(url)}&format=mp4&height={target_h}",
             })
             added = True
 
@@ -348,11 +350,14 @@ def extract_ytdlp(url: str, base_url: str) -> Dict[str, Any]:
 @app.get("/")
 def health_check():
     debug = _cookie_debug_info()
+    node_path = getattr(bg, "NODE_PATH", None) if PYTUBE_AVAILABLE else None
     return {
         "status": "healthy",
         "service": "vidfetch-worker",
-        "version": "1.5.0",
+        "version": "1.5.1",
         "pytube_available": PYTUBE_AVAILABLE,
+        "node_path": node_path,
+        "node_exists": bool(node_path and os.path.exists(node_path)),
         "yt_dlp_version": yt_dlp.version.__version__,
         "ffmpeg_available": bool(FFMPEG_BIN and os.path.exists(FFMPEG_BIN)),
         "cookies_configured": debug.get("configured", False),
@@ -363,31 +368,30 @@ def health_check():
 def get_video_info(request: Request, url: str = Query(..., description="Target video URL")):
     """
     Extract video metadata and download options for any platform.
-    Automatically leverages pytubefix with PO tokens for YouTube and yt-dlp for all platforms.
+    Automatically leverages yt-dlp (with android_vr) and pytubefix (with PO tokens).
     """
     base_url = get_base_service_url(request)
 
-    if is_youtube_url(url) and PYTUBE_AVAILABLE:
+    if is_youtube_url(url):
+        # 1. Try yt-dlp with android_vr first (reliable on datacenter IPs without bot block)
         try:
-            return extract_youtube_pytube(url, base_url)
-        except Exception as pytube_err:
-            # Fallback to yt-dlp if pytubefix encountered an unexpected error
-            try:
-                return extract_ytdlp(url, base_url)
-            except Exception as ytdlp_err:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"YouTube extraction error: {pytube_err}; Fallback error: {ytdlp_err}"
-                )
+            return extract_ytdlp(url, base_url)
+        except Exception as ytdlp_err:
+            # 2. Fall back to pytubefix if yt-dlp fails
+            if PYTUBE_AVAILABLE:
+                try:
+                    return extract_youtube_pytube(url, base_url)
+                except Exception as pytube_err:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"yt-dlp error: {ytdlp_err}; pytubefix error: {pytube_err}"
+                    )
+            raise HTTPException(status_code=500, detail=str(ytdlp_err))
 
+    # All non-YouTube platforms (TikTok, Instagram, Twitter, Facebook, etc.)
     try:
         return extract_ytdlp(url, base_url)
     except Exception as ytdlp_err:
-        if is_youtube_url(url) and PYTUBE_AVAILABLE:
-            try:
-                return extract_youtube_pytube(url, base_url)
-            except Exception:
-                pass
         raise HTTPException(status_code=500, detail=str(ytdlp_err))
 
 @app.get("/stream")
@@ -400,63 +404,106 @@ def stream_video(
     """
     Direct high-performance binary streaming proxy.
     Downloads from the resolved source CDN on Render and streams chunks to the client.
-    Guarantees that YouTube's IP-matching signature matches Render's outbound IP.
     """
-    headers = {
+    default_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "*/*",
     }
 
-    if is_youtube_url(url) and PYTUBE_AVAILABLE:
+    if is_youtube_url(url):
+        # 1. Try yt-dlp to resolve the exact stream and headers
         try:
-            yt = PytubeFix(url, client="WEB")
-            s = None
-            if itag:
-                s = yt.streams.get_by_itag(itag)
-            if not s and format == "mp3":
-                s = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-            if not s and height:
-                s = yt.streams.filter(res=f"{height}p", file_extension="mp4").first()
-            if not s:
-                s = yt.streams.filter(progressive=True).order_by("resolution").desc().first()
-            if not s:
-                s = yt.streams.filter(file_extension="mp4").order_by("resolution").desc().first()
+            opts = get_ydl_base_opts()
+            opts["skip_download"] = True
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                formats = info.get("formats", [])
 
-            if not s or not s.url:
-                raise HTTPException(status_code=404, detail="No suitable YouTube stream found")
+                chosen_format = None
+                if format == "mp3":
+                    audio_formats = [
+                        f for f in formats
+                        if f.get("url") and f.get("acodec") not in (None, "none")
+                    ]
+                    chosen_format = audio_formats[-1] if audio_formats else None
+                else:
+                    target_h = height or 720
+                    vid_formats = [
+                        f for f in formats
+                        if f.get("url") and f.get("height") and f.get("height") <= target_h
+                    ]
+                    chosen_format = vid_formats[-1] if vid_formats else None
 
-            # Stream chunks from the resolved google CDN URL
-            def chunk_generator():
-                with requests.get(s.url, headers=headers, stream=True, timeout=15) as r:
-                    r.raise_for_status()
-                    for chunk in r.iter_content(chunk_size=128 * 1024):
-                        if chunk:
-                            yield chunk
+                if chosen_format and chosen_format.get("url"):
+                    stream_headers = chosen_format.get("http_headers", default_headers)
+                    def chunk_gen():
+                        with requests.get(chosen_format["url"], headers=stream_headers, stream=True, timeout=20) as r:
+                            r.raise_for_status()
+                            for chunk in r.iter_content(chunk_size=128 * 1024):
+                                if chunk:
+                                    yield chunk
 
-            media_type = "audio/mpeg" if format == "mp3" else "video/mp4"
-            filename = f"vidfetch-{format}.{format}"
-            resp_headers = {
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Accept-Ranges": "bytes",
-            }
-            size = getattr(s, "filesize_approx", None)
-            if size:
-                resp_headers["Content-Length"] = str(size)
+                    media_type = "audio/mpeg" if format == "mp3" else "video/mp4"
+                    filename = f"vidfetch-{format}.{format}"
+                    resp_headers = {
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Accept-Ranges": "bytes",
+                    }
+                    size = chosen_format.get("filesize") or chosen_format.get("filesize_approx")
+                    if size:
+                        resp_headers["Content-Length"] = str(size)
 
-            return StreamingResponse(chunk_generator(), media_type=media_type, headers=resp_headers)
+                    return StreamingResponse(chunk_gen(), media_type=media_type, headers=resp_headers)
 
-        except HTTPException:
-            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
+            pass
 
-    # For other platforms or direct CDN URLs
+        # 2. Fall back to pytubefix streaming if yt-dlp did not resolve
+        if PYTUBE_AVAILABLE:
+            try:
+                yt = PytubeFix(url, client="WEB")
+                s = None
+                if itag:
+                    s = yt.streams.get_by_itag(itag)
+                if not s and format == "mp3":
+                    s = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+                if not s and height:
+                    s = yt.streams.filter(res=f"{height}p", file_extension="mp4").first()
+                if not s:
+                    s = yt.streams.filter(progressive=True).order_by("resolution").desc().first()
+                if not s:
+                    s = yt.streams.filter(file_extension="mp4").order_by("resolution").desc().first()
+
+                if s and s.url:
+                    def chunk_generator():
+                        with requests.get(s.url, headers=default_headers, stream=True, timeout=20) as r:
+                            r.raise_for_status()
+                            for chunk in r.iter_content(chunk_size=128 * 1024):
+                                if chunk:
+                                    yield chunk
+
+                    media_type = "audio/mpeg" if format == "mp3" else "video/mp4"
+                    filename = f"vidfetch-{format}.{format}"
+                    resp_headers = {
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Accept-Ranges": "bytes",
+                    }
+                    size = getattr(s, "filesize_approx", None)
+                    if size:
+                        resp_headers["Content-Length"] = str(size)
+
+                    return StreamingResponse(chunk_generator(), media_type=media_type, headers=resp_headers)
+
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
+
+    # General direct stream URL proxy
     target_url = url
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="Invalid stream URL")
 
     def general_chunk_generator():
-        with requests.get(target_url, headers=headers, stream=True, timeout=15) as r:
+        with requests.get(target_url, headers=default_headers, stream=True, timeout=20) as r:
             r.raise_for_status()
             for chunk in r.iter_content(chunk_size=128 * 1024):
                 if chunk:
@@ -472,79 +519,26 @@ def extract_video(
     format: str = Query("mp4", description="Desired format: mp4 or mp3"),
     height: int = Query(1080, description="Target resolution height (e.g. 1080)")
 ):
-    """
-    Resolves the stream endpoint for the given format/height.
-    Returns the streaming URL routed through this worker.
-    """
     base_url = get_base_service_url(request)
-
-    if is_youtube_url(url) and PYTUBE_AVAILABLE:
-        try:
-            yt = PytubeFix(url, client="WEB")
-            stream_url = f"{base_url}/stream?url={quote_plus(url)}&format={format}&height={height}"
-            return {
-                "url": stream_url,
-                "title": yt.title or "YouTube Video",
-                "format": format,
-                "quality": f"{height}p" if format != "mp3" else "audio",
-                "duration": yt.length,
-                "thumbnail": yt.thumbnail_url,
-            }
-        except Exception:
-            pass
+    stream_url = f"{base_url}/stream?url={quote_plus(url)}&format={format}&height={height}"
 
     try:
         opts = get_ydl_base_opts()
         opts["skip_download"] = True
-
-        if format == "mp3":
-            opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
-        else:
-            opts["format"] = (
-                f"bestvideo[height={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"best[height<={height}][ext=mp4]/"
-                f"best[height<={height}]/best"
-            )
-
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            if not info:
-                raise HTTPException(status_code=404, detail="No stream found")
-
-            raw = info.get("formats", [])
-            direct_url = info.get("url")
-
-            if format == "mp3":
-                audio_only = [
-                    f for f in raw
-                    if f.get("url") and
-                       f.get("vcodec") in (None, "none") and
-                       f.get("acodec") not in (None, "none")
-                ]
-                direct_url = audio_only[-1]["url"] if audio_only else direct_url
-            else:
-                if not direct_url:
-                    vid_only = [
-                        f for f in raw
-                        if f.get("url") and f.get("height") and (f.get("height") <= height)
-                    ]
-                    if vid_only:
-                        direct_url = vid_only[-1]["url"]
-
-            if not direct_url:
-                direct_url = f"{base_url}/stream?url={quote_plus(url)}&format={format}&height={height}"
-
             return {
-                "url": direct_url,
+                "url": stream_url,
                 "title": info.get("title", "Video"),
                 "format": format,
-                "quality": f"{info.get('height', height)}p" if format != "mp3" else "audio",
+                "quality": f"{height}p" if format != "mp3" else "audio",
                 "duration": info.get("duration"),
                 "thumbnail": info.get("thumbnail"),
             }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        return {
+            "url": stream_url,
+            "title": "Video",
+            "format": format,
+            "quality": f"{height}p" if format != "mp3" else "audio",
+        }
