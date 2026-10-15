@@ -30,12 +30,25 @@ app.add_middleware(
 def _write_cookies_to_tmp() -> Optional[str]:
     """If COOKIES_TEXT env var is set, write it to a temp file and return its path."""
     cookie_text = os.getenv("COOKIES_TEXT")
-    if cookie_text:
-        tmp = "/tmp/yt_cookies.txt"
-        with open(tmp, "w") as f:
-            f.write(cookie_text)
+    if not cookie_text:
+        return None
+
+    # Handle cases where newlines were escaped as literal '\n'
+    if "\\n" in cookie_text:
+        cookie_text = cookie_text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    cookie_text = cookie_text.replace("\r\n", "\n").strip()
+
+    # Ensure valid Netscape header
+    if not cookie_text.startswith("# Netscape"):
+        cookie_text = "# Netscape HTTP Cookie File\n" + cookie_text
+
+    tmp = "/tmp/yt_cookies.txt"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(cookie_text + "\n")
         return tmp
-    return None
+    except Exception:
+        return None
 
 def _cookie_file_path() -> Optional[str]:
     """Return the best available cookie file path, or None."""
@@ -43,11 +56,32 @@ def _cookie_file_path() -> Optional[str]:
     if env_file and os.path.exists(env_file):
         return env_file
     tmp = _write_cookies_to_tmp()
-    if tmp:
+    if tmp and os.path.exists(tmp):
         return tmp
     if os.path.exists("cookies.txt"):
         return "cookies.txt"
     return None
+
+def _cookie_debug_info() -> Dict[str, Any]:
+    c_path = _cookie_file_path()
+    if not c_path or not os.path.exists(c_path):
+        return {"configured": False}
+    try:
+        with open(c_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        domains = set()
+        for line in lines:
+            parts = line.split("\t")
+            if parts:
+                domains.add(parts[0])
+        return {
+            "configured": True,
+            "line_count": len(lines),
+            "has_youtube": any("youtube" in d for d in domains),
+            "domains": sorted(list(domains))[:8],
+        }
+    except Exception as e:
+        return {"configured": True, "error": str(e)}
 
 # ─── yt-dlp options factory ─────────────────────────────────────
 
@@ -66,10 +100,10 @@ def get_ydl_base_opts() -> Dict[str, Any]:
     }
     if cookie_file:
         opts["cookiefile"] = cookie_file
-        # Browser cookies are only sent to web/mweb clients
+        # When browser cookies are provided, use web and mweb clients which accept session cookies
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["web", "mweb", "android_vr"]
+                "player_client": ["web", "mweb"]
             }
         }
     else:
@@ -84,14 +118,15 @@ def get_ydl_base_opts() -> Dict[str, Any]:
 
 @app.get("/")
 def health_check():
-    cookie_file = _cookie_file_path()
+    debug = _cookie_debug_info()
     return {
         "status": "healthy",
         "service": "vidfetch-worker",
-        "version": "1.3.0",
+        "version": "1.3.1",
         "yt_dlp_version": yt_dlp.version.__version__,
         "ffmpeg_available": bool(FFMPEG_BIN and os.path.exists(FFMPEG_BIN)),
-        "cookies_configured": cookie_file is not None,
+        "cookies_configured": debug.get("configured", False),
+        "cookie_debug": debug,
     }
 
 @app.get("/info")
